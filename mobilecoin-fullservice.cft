@@ -1,0 +1,110 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: AWS CloudFormation template for the creation and storing of a mobilecoin wallet.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: m5a.xlarge
+    AllowedValues:
+      - t3a.nano # for testing userdata
+      - m5a.xlarge # required size for secure enclave
+    ConstraintDescription: must be a valid EC2 instance type.
+    Description: EC2 instance type
+
+  KeyName:
+    Type: "AWS::EC2::KeyPair::KeyName"
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+
+  SSHLocation:
+    Type: String
+    Default: "0.0.0.0/0"
+    AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+    Description: The IP address range that can be used to SSH to the EC2 instances, if you want to lock down your server you will want to set this
+    MaxLength: "18"
+    MinLength: "9"
+
+  VPCId:
+    Type: "AWS::EC2::VPC::Id"
+    ConstraintDescription: must be the id of an existing VPC
+    Description: VPC id for the server to launch within
+
+Metadata:
+  License: Apache-2.0
+
+Resources:
+  InstanceSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Enable SSH access and HTTP access on the inbound port
+      SecurityGroupEgress:
+        - CidrIp: "0.0.0.0/0"
+          FromPort: "443"
+          IpProtocol: tcp
+          ToPort: "443"
+        - CidrIp: "0.0.0.0/0"
+          FromPort: "80"
+          IpProtocol: tcp
+          ToPort: "80"
+      SecurityGroupIngress:
+        - CidrIp: !Ref SSHLocation
+          FromPort: "22"
+          IpProtocol: tcp
+          ToPort: "22"
+      VpcId: !Ref VPCId
+
+  LaunchTemplate:
+    Type: "AWS::EC2::LaunchTemplate"
+    Metadata:
+      Comment: Install a simple application
+    Properties:
+      LaunchTemplateData:
+        EnclaveOptions:
+          Enabled: true
+        ImageId: ami-0e6c244d17cd7a4cd
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - Ref: InstanceSecurityGroup
+        UserData: !Base64 |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          SGX_URL="https://download.01.org/intel-sgx/sgx-linux/2.13/distro/ubuntu20.04-server/sgx_linux_x64_sdk_2.13.100.4.bin"
+          apt update -y
+          apt install git build-essential cmake protobuf-compiler llvm libclang-dev libsqlite3-dev libssl1.1 cargo -y
+          git clone https://github.com/mobilecoinofficial/full-service.git
+          cd full-service
+          git submodule init
+          git submodule update
+          NAMESPACE=test
+          SIGNED_ENCLAVE_URI=$(curl -s https://enclave-distribution.${NAMESPACE}.mobilecoin.com/production.json | grep consensus-enclave.css | awk -F\" '{print $4}')
+          curl -O https://enclave-distribution.${NAMESPACE}.mobilecoin.com/${SIGNED_ENCLAVE_URI}
+          wget $SGX_URL
+          SGX_FILENAME=$(echo $SGX_URL | awk -F "/" '{print $NF}')
+          chmod +x $SGX_FILENAME
+          ./$SGX_FILENAME --prefix=/opt/intel
+          source /opt/intel/sgxsdk/environment
+          export SGX_MODE=HW IAS_MODE=PROD CONSENSUS_ENCLAVE_CSS=/full-service/consensus-enclave.css
+          cargo build --release -p mc-full-service
+          mkdir -p /tmp/wallet-db/
+          ./target/release/full-service \
+            --wallet-db /tmp/wallet-db/wallet.db \
+            --ledger-db /tmp/ledger-db/ \
+            --peer mc://node1.test.mobilecoin.com/ \
+            --peer mc://node2.test.mobilecoin.com/ \
+            --tx-source-url https://s3-us-west-1.amazonaws.com/mobilecoin.chain/node1.test.mobilecoin.com/ \
+            --tx-source-url https://s3-us-west-1.amazonaws.com/mobilecoin.chain/node2.test.mobilecoin.com/
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource ServerGroup --region ${AWS::Region}
+          
+
+  ServerGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      AvailabilityZones: !GetAZs ""
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: 1
+      MaxSize: "1"
+      MinSize: "1"
